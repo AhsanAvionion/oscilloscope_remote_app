@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- VISA.NET Shared Components 8.0.1 and IVI.NET Shared Components 3.0.0
+         are .NET Framework 4.x assemblies, so target the framework they match. -->
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>ScopeControl</AssemblyName>
+    <RootNamespace>ScopeControl</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- Keysight.Visa loads ktvisa64.dll in a 64-bit process and
+         ktvisa32.dll in a 32-bit one. Only 64-bit VISA is installed, so
+         a 32-bit build fails with DllNotFoundException. -->
+    <Prefer32Bit>false</Prefer32Bit>
+    <Platforms>AnyCPU;x64</Platforms>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+  </PropertyGroup>
+
+  <!--
+    Point this at Ivi.Visa.dll on your machine. The path below matches
+    VISA.NET Shared Components 8.0.1 (64-bit) in a default install; if yours
+    differs, run this in PowerShell and paste the result in:
+
+      Get-ChildItem "C:\Program Files\IVI Foundation" -Recurse -Filter Ivi.Visa.dll |
+        Select-Object -ExpandProperty FullName
+  -->
+  <PropertyGroup>
+    <IviVisaDll>C:\Program Files\IVI Foundation\VISA\Microsoft.NET\Framework64\v4.0.30319\VISA.NET Shared Components 8.0.1\Ivi.Visa.dll</IviVisaDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Ivi.Visa">
+      <HintPath>$(IviVisaDll)</HintPath>
+      <!-- It lives in the GAC; don't copy it next to the exe. -->
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!--
+    Keysight.Visa is deliberately NOT referenced. GlobalResourceManager finds
+    the installed vendor implementation at run time through the IVI
+    Configuration Store, so compiling against it would only add a version to
+    keep in step.
+  -->
+
+  <Target Name="CheckVisaReference" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(IviVisaDll)')"
+           Text="Ivi.Visa.dll was not found at &quot;$(IviVisaDll)&quot;. Run the PowerShell command in the csproj comment to locate it, then update the IviVisaDll property." />
+  </Target>
+
+</Project>
