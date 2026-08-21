@@ -126,16 +126,13 @@ namespace ScopeControl.UI
 
         public static CheckBox Check(string text, int x, int y, int width)
         {
-            return new CheckBox
+            // DarkCheckBox, not CheckBox: the stock tick is drawn from the
+            // Windows theme and is barely visible on this palette.
+            return new DarkCheckBox
             {
                 Text = text,
                 Location = new Point(x, y),
-                Size = new Size(width, 20),
-                ForeColor = Theme.Text,
-                BackColor = Color.Transparent,
-                Font = Theme.Ui,
-                FlatStyle = FlatStyle.Flat,
-                TabStop = false
+                Size = new Size(width, 20)
             };
         }
 

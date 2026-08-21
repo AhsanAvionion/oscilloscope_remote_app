@@ -40,6 +40,7 @@ namespace ScopeControl.UI
                 else if (e.KeyCode == Keys.Down) { Nudge(-1); e.SuppressKeyPress = true; }
             };
             _text.Leave += (s, e) => Commit();
+            _text.Enter += (s, e) => EntryFocused?.Invoke(this, EventArgs.Empty);
 
             _down = MakeKey("\u25BC", () => Nudge(-1));
             _up = MakeKey("\u25B2", () => Nudge(+1));
@@ -82,6 +83,12 @@ namespace ScopeControl.UI
 
         /// <summary>Fires when the user commits a new value (not when code sets it).</summary>
         public event EventHandler ValueCommitted;
+
+        /// <summary>Fires when the text field takes focus.</summary>
+        public event EventHandler EntryFocused;
+
+        /// <summary>True while the text field holds focus.</summary>
+        public bool EntryHasFocus => _text != null && _text.Focused;
 
         public double Value
         {

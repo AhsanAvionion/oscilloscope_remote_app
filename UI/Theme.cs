@@ -38,6 +38,9 @@ namespace ScopeControl.UI
 
         public static Color Channel(int number) => ChannelColors[(number - 1) % 4];
 
+        /// <summary>The math waveform, purple as on the instrument.</summary>
+        public static readonly Color Math = Color.FromArgb(176, 132, 255);
+
         public static readonly Font Ui = new Font("Segoe UI", 8.5f, FontStyle.Regular);
         public static readonly Font UiBold = new Font("Segoe UI", 8.5f, FontStyle.Bold);
         public static readonly Font Header = new Font("Segoe UI Semibold", 8f, FontStyle.Bold);
