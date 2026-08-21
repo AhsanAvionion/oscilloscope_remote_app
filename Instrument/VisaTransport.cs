@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using Ivi.Visa;
@@ -160,6 +161,44 @@ namespace ScopeControl.Instrument
             return _session.RawIO.ReadString();
         }
 
+        /// <summary>
+        /// Reads the screenshot as one complete VISA message.
+        ///
+        /// The previous approach asked for exactly the byte count in the block
+        /// header and then read the trailing newline separately. On a USBTMC
+        /// link that leaves the transfer unfinished: the instrument still has
+        /// the end of its message to send, the next command collides with it,
+        /// and the instrument parses the wreckage as an undefined header. So
+        /// read until the instrument signals the end, then parse from memory.
+        /// </summary>
+        public byte[] ReadDefiniteBlock()
+        {
+            Ensure();
+
+            const int chunkSize = 1024 * 1024;      // one read covers any screenshot
+            var message = new List<byte>();
+
+            while (true)
+            {
+                byte[] chunk = _session.RawIO.Read(chunkSize);
+                if (chunk == null || chunk.Length == 0) break;
+
+                message.AddRange(chunk);
+
+                // A short read means the instrument asserted END: the message
+                // is complete and nothing is left pending on the link.
+                if (chunk.Length < chunkSize) break;
+            }
+
+            return BlockReader.Parse(message.ToArray());
+        }
+
+        public void Clear()
+        {
+            if (_session == null) return;
+            try { _session.Clear(); } catch (Exception) { }
+        }
+
         public byte[] ReadBytes(int count)
         {
             Ensure();
@@ -174,6 +213,49 @@ namespace ScopeControl.Instrument
                 got += chunk.Length;
             }
             return buffer;
+        }
+
+        /// <summary>
+        /// Asks VISA what is attached. This is how a USB (USBTMC) instrument is
+        /// found: its address carries the vendor id, product id and serial
+        /// number, so it cannot sensibly be typed from memory.
+        /// </summary>
+        public static string[] FindResources()
+        {
+            var found = new List<string>();
+
+            foreach (string pattern in new[] { "?*INSTR", "?*SOCKET" })
+            {
+                try
+                {
+                    foreach (string name in GlobalResourceManager.Find(pattern))
+                        if (!found.Contains(name)) found.Add(name);
+                }
+                catch (Exception)
+                {
+                    // Discovery not available through the shared components;
+                    // fall through to the vendor implementation below.
+                }
+            }
+
+            if (found.Count == 0)
+            {
+                IResourceManager vendor = VisaImplementationLoader.Find();
+                if (vendor != null)
+                {
+                    foreach (string pattern in new[] { "?*INSTR", "?*SOCKET" })
+                    {
+                        try
+                        {
+                            foreach (string name in vendor.Find(pattern))
+                                if (!found.Contains(name)) found.Add(name);
+                        }
+                        catch (Exception) { }
+                    }
+                }
+            }
+
+            return found.ToArray();
         }
 
         public void Dispose() => Close();

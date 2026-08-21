@@ -19,8 +19,32 @@ namespace ScopeControl.Instrument
         public bool Invert;
     }
 
+    public sealed class MathState
+    {
+        public bool Display;
+        public string Operation = "ADD";
+        public string Source1 = "CHAN1";
+        public string Source2 = "CHAN2";
+        public double Scale = 1.0;
+        public double Offset;
+        public string Window = "HANN";
+        public double Center;
+        public double Span;
+    }
+
+    public sealed class MarkerState
+    {
+        public string Mode = "OFF";
+        public string X1Y1Source = "CHAN1";
+        public string X2Y2Source = "CHAN1";
+        public double X1, X2, Y1, Y2;
+        public double XDelta, YDelta;
+    }
+
     public sealed class ScopeState
     {
+        public MathState Math = new MathState();
+        public MarkerState Markers = new MarkerState();
         public ChannelState[] Channels = { new ChannelState(), new ChannelState(), new ChannelState(), new ChannelState() };
         public double TimeScale = 1e-3;     // s/div
         public double TimePosition;         // s, delay
@@ -48,8 +72,40 @@ namespace ScopeControl.Instrument
         private IScopeTransport _transport;
         private bool _insideErrorCheck;
 
+        // Commands this instrument answered with "undefined header". Each one
+        // costs a full timeout, so there is no sense sending it twice. Cleared
+        // on connect, since the next instrument may be a different model.
+        private readonly System.Collections.Generic.HashSet<string> _unsupported =
+            new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // What we last told the instrument, so settings are not re-sent on every
+        // capture. Null means unknown: after connecting, or after a reset that
+        // moved the instrument out from under us.
+        private bool? _inkSaverState;
+
+        // Not every model has :HARDcopy:INKSaver. Once it is rejected there is
+        // no point sending it again, and leaving its error in the queue makes
+        // the next unrelated failure look like something it is not.
+        private bool _inkSaverSupported = true;
+
+        /// <summary>
+        /// A measurement that cannot be made never replies, so it costs a whole
+        /// timeout. Keep that short: it is a readout, not a command that matters.
+        /// </summary>
+        public const int MeasurementTimeoutMs = 2000;
+
         public string Identity { get; private set; } = string.Empty;
         public bool AutoErrorCheck { get; set; } = true;
+
+        /// <summary>
+        /// Set from the model profile. Also cleared automatically if the
+        /// instrument rejects the command.
+        /// </summary>
+        public bool InkSaverSupported
+        {
+            get => _inkSaverSupported;
+            set { _inkSaverSupported = value; _inkSaverState = null; }
+        }
         public bool IsConnected => _transport != null && _transport.IsOpen;
         public string ResourceName => _transport?.ResourceName ?? string.Empty;
 
@@ -80,9 +136,18 @@ namespace ScopeControl.Instrument
                     _transport.TimeoutMilliseconds = DefaultTimeoutMs;
                     _transport.Open();
                     Log(IoDirection.Info, "Opened " + _transport.ResourceName);
+                    _inkSaverState = null;      // new session, nothing is known
+                    _unsupported.Clear();
                     Identity = QueryCore("*IDN?");
                     WriteCore("*CLS");
-                    WriteCore(":SYSTem:HEADer OFF");
+
+                    // No :SYSTem:HEADer here. That is an Infiniium command;
+                    // InfiniiVision has no header mode and answers it with
+                    // -113, which then sits in the queue and gets blamed on
+                    // whatever fails next.
+                    string leftover = ReadFirstError();
+                    if (leftover.Length > 0)
+                        Log(IoDirection.Error, "Error queue was not empty on connect: " + leftover);
                 }).ConfigureAwait(false);
                 return Identity;
             }
@@ -132,22 +197,123 @@ namespace ScopeControl.Instrument
             if (AutoErrorCheck && !_insideErrorCheck) CheckErrorsCore();
         }
 
+        /// <summary>The header part of a command, without its arguments.</summary>
+        private static string HeaderOf(string command)
+        {
+            string text = (command ?? string.Empty).Trim();
+            int space = text.IndexOf(' ');
+            return space > 0 ? text.Substring(0, space) : text;
+        }
+
         private string QueryCore(string command)
         {
             Ensure();
+
+            if (_unsupported.Contains(HeaderOf(command)))
+                throw new NotSupportedException(HeaderOf(command) + " is not supported by this instrument.");
+
             _transport.Write(command);
             Log(IoDirection.Tx, command);
-            string answer = _transport.ReadString().Trim();
+
+            string answer;
+            try
+            {
+                answer = _transport.ReadString().Trim();
+            }
+            catch (Exception ex)
+            {
+                RecoverFromSilence(command, ex);
+                throw;
+            }
+
             Log(IoDirection.Rx, answer);
             return answer;
         }
 
+        /// <summary>
+        /// Called when a query produced no reply. Two things matter here: saying
+        /// why, and leaving the link usable.
+        ///
+        /// An unsupported command and a busy instrument both look like silence,
+        /// so the error queue is read to tell them apart - "-113 Undefined
+        /// header" means the command does not exist on this model. The device
+        /// clear matters just as much: without it a late reply would be read as
+        /// the answer to the next command, and every exchange afterwards would
+        /// be one out of step. That is why one timeout used to break everything
+        /// that followed.
+        /// </summary>
+        private void RecoverFromSilence(string command, Exception cause)
+        {
+            Log(IoDirection.Error, "No reply to " + command + " (" + cause.Message + ")");
+
+            try { _transport.Clear(); } catch (Exception) { }
+
+            int saved = _transport.TimeoutMilliseconds;
+            bool savedQuiet = _quiet;
+            _quiet = false;
+            try
+            {
+                _transport.TimeoutMilliseconds = 2000;
+                _transport.Write(":SYSTem:ERRor?");
+                string reply = _transport.ReadString().Trim();
+
+                if (reply.StartsWith("+0,") || reply.StartsWith("0,"))
+                {
+                    Log(IoDirection.Error,
+                        "The instrument reports no error, so it accepted " + command +
+                        " but had no result ready. This usually means it is not " +
+                        "triggering: in Normal sweep with no trigger, measurements " +
+                        "never complete. Try Auto sweep or press Run.");
+                }
+                else
+                {
+                    // The queue is first-in-first-out, so this entry may belong
+                    // to an earlier command rather than the one that just timed
+                    // out. Report it, do not attribute it.
+                    Log(IoDirection.Error, "Error queue held: " + reply +
+                        "  (this may relate to an earlier command)");
+
+                    if (reply.StartsWith("-113"))
+                    {
+                        string header = HeaderOf(command);
+                        _unsupported.Add(header);
+                        Log(IoDirection.Error,
+                            header + " will not be sent again this session.");
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                Log(IoDirection.Error, "The instrument is not responding at all. Reconnect if this repeats.");
+            }
+            finally
+            {
+                _quiet = savedQuiet;
+                try { _transport.TimeoutMilliseconds = saved; } catch (Exception) { }
+            }
+
+            try { _transport.Write("*CLS"); } catch (Exception) { }
+        }
+
         private double QueryDoubleCore(string command) => Eng.ParseScpi(QueryCore(command));
 
-        private bool QueryBoolCore(string command)
+        /// <summary>Pops one entry from the error queue, or "" when clear.</summary>
+        private string ReadFirstError()
         {
-            string s = QueryCore(command);
-            return s.StartsWith("1") || s.StartsWith("ON", StringComparison.OrdinalIgnoreCase);
+            bool saved = _insideErrorCheck;
+            _insideErrorCheck = true;
+            try
+            {
+                _transport.Write(":SYSTem:ERRor?");
+                string reply = _transport.ReadString().Trim();
+                if (reply.StartsWith("+0,") || reply.StartsWith("0,")) return string.Empty;
+                return reply;
+            }
+            catch (Exception)
+            {
+                return string.Empty;
+            }
+            finally { _insideErrorCheck = saved; }
         }
 
         private void CheckErrorsCore()
@@ -241,6 +407,86 @@ namespace ScopeControl.Instrument
         public Task SetChannelImpedanceAsync(int ch, bool fiftyOhm) =>
             RunAsync(() => WriteCore(":CHANnel" + ch + ":IMPedance " + (fiftyOhm ? "FIFTy" : "ONEMeg")));
 
+        // ------------------------------------------------------------------ math
+
+        public Task SetMathDisplayAsync(bool on) =>
+            RunAsync(() => WriteCore(":FUNCtion:DISPlay " + (on ? "ON" : "OFF")));
+
+        public Task SetMathOperationAsync(string operation) =>
+            RunAsync(() => WriteCore(":FUNCtion:OPERation " + operation));
+
+        public Task SetMathSourceAsync(int index, string source) =>
+            RunAsync(() => WriteCore(":FUNCtion:SOURce" + index + " " + source));
+
+        public Task SetMathScaleAsync(double perDiv) =>
+            RunAsync(() => WriteCore(":FUNCtion:SCALe " + Eng.Scpi(perDiv)));
+
+        public Task SetMathOffsetAsync(double offset) =>
+            RunAsync(() => WriteCore(":FUNCtion:OFFSet " + Eng.Scpi(offset)));
+
+        public Task SetMathWindowAsync(string window) =>
+            RunAsync(() => WriteCore(":FUNCtion:WINDow " + window));
+
+        public Task SetMathCenterAsync(double hz) =>
+            RunAsync(() => WriteCore(":FUNCtion:CENTer " + Eng.Scpi(hz)));
+
+        public Task SetMathSpanAsync(double hz) =>
+            RunAsync(() => WriteCore(":FUNCtion:SPAN " + Eng.Scpi(hz)));
+
+        /// <summary>Selects the math waveform, the same display cycle the channels use.</summary>
+        public Task SelectMathAsync(bool alreadyVisible)
+        {
+            return RunAsync(() =>
+            {
+                if (alreadyVisible) WriteCore(":FUNCtion:DISPlay OFF");
+                WriteCore(":FUNCtion:DISPlay ON");
+            });
+        }
+
+        /// <summary>True for operations that combine two sources.</summary>
+        public static bool IsBinaryOperation(string operation)
+        {
+            string op = (operation ?? string.Empty).ToUpperInvariant();
+            return op.StartsWith("ADD") || op.StartsWith("SUBT")
+                || op.StartsWith("MULT") || op.StartsWith("DIV");
+        }
+
+        public static bool IsFftOperation(string operation)
+        {
+            return (operation ?? string.Empty).ToUpperInvariant().StartsWith("FFT");
+        }
+
+        // --------------------------------------------------------------- cursors
+
+        /// <summary>
+        /// Cursors are the MARKer subsystem. MANual gives two independent X and
+        /// Y cursors; WAVeform ties Y to the waveform at each X.
+        /// </summary>
+        public Task SetMarkerModeAsync(string mode) =>
+            RunAsync(() => WriteCore(":MARKer:MODE " + mode));
+
+        public Task SetMarkerX1SourceAsync(string source) =>
+            RunAsync(() => WriteCore(":MARKer:X1Y1source " + source));
+
+        public Task SetMarkerX2SourceAsync(string source) =>
+            RunAsync(() => WriteCore(":MARKer:X2Y2source " + source));
+
+        public Task SetMarkerXAsync(int index, double seconds) =>
+            RunAsync(() => WriteCore(":MARKer:X" + index + "Position " + Eng.Scpi(seconds)));
+
+        public Task SetMarkerYAsync(int index, double volts) =>
+            RunAsync(() => WriteCore(":MARKer:Y" + index + "Position " + Eng.Scpi(volts)));
+
+        /// <summary>Reads both deltas in one trip, for the cursor readout.</summary>
+        public Task<double[]> ReadMarkerDeltasAsync()
+        {
+            return RunAsync(() => new[]
+            {
+                QueryDoubleCore(":MARKer:XDELta?"),
+                QueryDoubleCore(":MARKer:YDELta?")
+            });
+        }
+
         // ------------------------------------------------------------ horizontal
 
         public Task SetTimeScaleAsync(double secondsPerDiv) =>
@@ -331,6 +577,7 @@ namespace ScopeControl.Instrument
                 {
                     WriteCore("*RST");
                     QueryCore("*OPC?");
+                    _inkSaverState = null;      // the reset undid whatever we set
                 }
                 finally { _transport.TimeoutMilliseconds = saved; }
             });
@@ -339,6 +586,26 @@ namespace ScopeControl.Instrument
 
         public Task<double> MeasureAsync(string measurement, string source) =>
             RunAsync(() => QueryDoubleCore(":MEASure:" + measurement + "? " + source));
+
+        /// <summary>Adds a measurement to the instrument's on-screen readout.</summary>
+        public Task AddMeasurementAsync(Measurement measurement, string source,
+                                        string interval = "DISPlay", string type = "AC") =>
+            RunAsync(() => WriteCore(measurement.AddCommand(source, interval, type)));
+
+        /// <summary>Reads a measurement without altering what is displayed.</summary>
+        public Task<double> QueryMeasurementAsync(Measurement measurement, string source,
+                                                  string interval = "DISPlay", string type = "AC")
+        {
+            return RunAsync(() =>
+            {
+                int saved = _transport.TimeoutMilliseconds;
+                _transport.TimeoutMilliseconds = MeasurementTimeoutMs;
+                try { return QueryDoubleCore(measurement.QueryCommand(source, interval, type)); }
+                finally { try { _transport.TimeoutMilliseconds = saved; } catch (Exception) { } }
+            });
+        }
+
+        public Task ClearMeasurementsAsync() => RunAsync(() => WriteCore(":MEASure:CLEar"));
 
         // ------------------------------------------------------------ screenshot
 
@@ -356,12 +623,40 @@ namespace ScopeControl.Instrument
                 AutoErrorCheck = false;
                 try
                 {
-                    WriteCore(":HARDcopy:INKSaver " + (inkSaver ? "ON" : "OFF"));
+                    if (_inkSaverSupported && _inkSaverState != inkSaver)
+                    {
+                        // Empty the queue first. A stale entry would otherwise
+                        // be read as this command's verdict, which is exactly how
+                        // an unrelated error got blamed on it before.
+                        while (ReadFirstError().Length > 0) { }
+
+                        WriteCore(":HARDcopy:INKSaver " + (inkSaver ? "ON" : "OFF"));
+                        string problem = ReadFirstError();
+                        if (problem.StartsWith("-113"))
+                        {
+                            _inkSaverSupported = false;
+                            Log(IoDirection.Error,
+                                ":HARDcopy:INKSaver is not supported by this instrument. " +
+                                "Screens will use the instrument's current setting instead.");
+                        }
+                        else
+                        {
+                            if (problem.Length > 0) Log(IoDirection.Error, problem);
+                            _inkSaverState = inkSaver;
+                        }
+                    }
                     Ensure();
                     _transport.Write(":DISPlay:DATA? PNG,COLor");
                     Log(IoDirection.Tx, ":DISPlay:DATA? PNG,COLor");
-                    byte[] image = ReadDefiniteLengthBlock();
+                    byte[] image = _transport.ReadDefiniteBlock();
                     Log(IoDirection.Rx, "<screen image, " + image.Length + " bytes>");
+
+                    // A screenshot is by far the largest transfer we do, and any
+                    // residue left on the link turns the next command into
+                    // gibberish that the instrument answers with -113. Clearing
+                    // costs nothing and guarantees a clean start.
+                    try { _transport.Clear(); } catch (Exception) { }
+
                     return image;
                 }
                 finally
@@ -370,37 +665,6 @@ namespace ScopeControl.Instrument
                     _transport.TimeoutMilliseconds = saved;
                 }
             });
-        }
-
-        /// <summary>Reads an IEEE 488.2 definite-length block: #&lt;n&gt;&lt;length&gt;&lt;data&gt;.</summary>
-        private byte[] ReadDefiniteLengthBlock()
-        {
-            byte[] head = _transport.ReadBytes(1);
-            if (head[0] != (byte)'#')
-                throw new IOException("Expected a block header, got byte 0x" + head[0].ToString("X2") + ".");
-
-            int digits = _transport.ReadBytes(1)[0] - '0';
-            if (digits < 1 || digits > 9)
-                throw new IOException("Block header declares " + digits + " length digits.");
-
-            string lengthText = Encoding.ASCII.GetString(_transport.ReadBytes(digits));
-            if (!int.TryParse(lengthText, out int length) || length <= 0)
-                throw new IOException("Block length '" + lengthText + "' is not usable.");
-
-            byte[] data = _transport.ReadBytes(length);
-
-            // Keysight appends a newline after the block. Swallow it so the next
-            // response does not start with stale data; a timeout here is harmless.
-            int saved = _transport.TimeoutMilliseconds;
-            try
-            {
-                _transport.TimeoutMilliseconds = 800;
-                _transport.ReadBytes(1);
-            }
-            catch { }
-            finally { _transport.TimeoutMilliseconds = saved; }
-
-            return data;
         }
 
         // ----------------------------------------------------------- read it all
@@ -422,33 +686,90 @@ namespace ScopeControl.Instrument
                     {
                         int ch = i + 1;
                         var c = state.Channels[i];
-                        c.Display = QueryBoolCore(":CHANnel" + ch + ":DISPlay?");
-                        c.Scale = QueryDoubleCore(":CHANnel" + ch + ":SCALe?");
-                        c.Offset = QueryDoubleCore(":CHANnel" + ch + ":OFFSet?");
-                        c.Coupling = QueryCore(":CHANnel" + ch + ":COUPling?");
-                        c.Probe = QueryDoubleCore(":CHANnel" + ch + ":PROBe?");
-                        c.BwLimit = QueryBoolCore(":CHANnel" + ch + ":BWLimit?");
-                        c.Invert = QueryBoolCore(":CHANnel" + ch + ":INVert?");
+                        c.Display = TryBool(":CHANnel" + ch + ":DISPlay?", c.Display);
+                        c.Scale = TryDouble(":CHANnel" + ch + ":SCALe?", c.Scale);
+                        c.Offset = TryDouble(":CHANnel" + ch + ":OFFSet?", c.Offset);
+                        c.Coupling = TryText(":CHANnel" + ch + ":COUPling?", c.Coupling);
+                        c.Probe = TryDouble(":CHANnel" + ch + ":PROBe?", c.Probe);
+                        c.BwLimit = TryBool(":CHANnel" + ch + ":BWLimit?", c.BwLimit);
+                        c.Invert = TryBool(":CHANnel" + ch + ":INVert?", c.Invert);
                     }
 
-                    state.TimeScale = QueryDoubleCore(":TIMebase:SCALe?");
-                    state.TimePosition = QueryDoubleCore(":TIMebase:POSition?");
-                    state.TimeReference = QueryCore(":TIMebase:REFerence?");
+                    state.TimeScale = TryDouble(":TIMebase:SCALe?", state.TimeScale);
+                    state.TimePosition = TryDouble(":TIMebase:POSition?", state.TimePosition);
+                    state.TimeReference = TryText(":TIMebase:REFerence?", state.TimeReference);
 
-                    state.TriggerSweep = QueryCore(":TRIGger:SWEep?");
-                    state.TriggerMode = QueryCore(":TRIGger:MODE?");
-                    state.TriggerSource = QueryCore(":TRIGger:EDGE:SOURce?");
-                    state.TriggerSlope = QueryCore(":TRIGger:EDGE:SLOPe?");
-                    state.TriggerLevel = QueryDoubleCore(":TRIGger:EDGE:LEVel?");
-                    state.TriggerCoupling = QueryCore(":TRIGger:COUPling?");
+                    state.TriggerSweep = TryText(":TRIGger:SWEep?", state.TriggerSweep);
+                    state.TriggerMode = TryText(":TRIGger:MODE?", state.TriggerMode);
+                    state.TriggerSource = TryText(":TRIGger:EDGE:SOURce?", state.TriggerSource);
+                    state.TriggerSlope = TryText(":TRIGger:EDGE:SLOPe?", state.TriggerSlope);
+                    state.TriggerLevel = TryDouble(":TRIGger:EDGE:LEVel?", state.TriggerLevel);
+                    state.TriggerCoupling = TryText(":TRIGger:COUPling?", state.TriggerCoupling);
 
-                    state.AcquireType = QueryCore(":ACQuire:TYPE?");
-                    state.AcquireCount = (int)QueryDoubleCore(":ACQuire:COUNt?");
+                    var math = state.Math;
+                    math.Display = TryBool(":FUNCtion:DISPlay?", math.Display);
+                    math.Operation = TryText(":FUNCtion:OPERation?", math.Operation);
+                    math.Source1 = TryText(":FUNCtion:SOURce1?", math.Source1);
+                    // Asking for SOURce2 on a one-source operation is a command
+                    // error, and an error means no reply, which would cost a
+                    // whole timeout for nothing.
+                    if (IsBinaryOperation(math.Operation))
+                        math.Source2 = TryText(":FUNCtion:SOURce2?", math.Source2);
+                    math.Scale = TryDouble(":FUNCtion:SCALe?", math.Scale);
+                    math.Offset = TryDouble(":FUNCtion:OFFSet?", math.Offset);
+                    if (IsFftOperation(math.Operation))
+                    {
+                        math.Window = TryText(":FUNCtion:WINDow?", math.Window);
+                        math.Center = TryDouble(":FUNCtion:CENTer?", math.Center);
+                        math.Span = TryDouble(":FUNCtion:SPAN?", math.Span);
+                    }
+
+                    var markers = state.Markers;
+                    markers.Mode = TryText(":MARKer:MODE?", markers.Mode);
+                    if (!markers.Mode.ToUpperInvariant().StartsWith("OFF"))
+                    {
+                        markers.X1Y1Source = TryText(":MARKer:X1Y1source?", markers.X1Y1Source);
+                        markers.X2Y2Source = TryText(":MARKer:X2Y2source?", markers.X2Y2Source);
+                        markers.X1 = TryDouble(":MARKer:X1Position?", markers.X1);
+                        markers.X2 = TryDouble(":MARKer:X2Position?", markers.X2);
+                        markers.Y1 = TryDouble(":MARKer:Y1Position?", markers.Y1);
+                        markers.Y2 = TryDouble(":MARKer:Y2Position?", markers.Y2);
+                    }
+
+                    state.AcquireType = TryText(":ACQuire:TYPE?", state.AcquireType);
+                    state.AcquireCount = (int)TryDouble(":ACQuire:COUNt?", state.AcquireCount);
 
                     return state;
                 }
                 finally { AutoErrorCheck = savedCheck; _quiet = savedQuiet; }
             });
+        }
+
+        /// <summary>
+        /// One reading that is allowed to fail. QueryCore has already flushed
+        /// the link and reported the reason by the time we get here, so the
+        /// remaining readings carry on with the value they had.
+        /// </summary>
+        private string TryText(string command, string fallback)
+        {
+            try { return QueryCore(command); }
+            catch (Exception) { return fallback; }
+        }
+
+        private double TryDouble(string command, double fallback)
+        {
+            try { return Eng.ParseScpi(QueryCore(command)); }
+            catch (Exception) { return fallback; }
+        }
+
+        private bool TryBool(string command, bool fallback)
+        {
+            try
+            {
+                string reply = QueryCore(command);
+                return reply.StartsWith("1") || reply.StartsWith("ON", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception) { return fallback; }
         }
     }
 }

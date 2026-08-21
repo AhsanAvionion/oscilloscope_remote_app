@@ -105,6 +105,17 @@ namespace ScopeControl.Instrument
             return sb.ToString();
         }
 
+        public void Clear()
+        {
+            if (_stream == null) return;
+            try
+            {
+                var scratch = new byte[4096];
+                while (_stream.DataAvailable) _stream.Read(scratch, 0, scratch.Length);
+            }
+            catch (Exception) { }
+        }
+
         public byte[] ReadBytes(int count)
         {
             Ensure();
@@ -118,6 +129,8 @@ namespace ScopeControl.Instrument
             }
             return buffer;
         }
+
+        public byte[] ReadDefiniteBlock() => BlockReader.ReadIncremental(this);
 
         public void Dispose() => Close();
 

@@ -167,6 +167,14 @@ namespace ScopeControl.Instrument
             throw new IOException("VISA-COM returned an unexpected read type: " + result.GetType().Name);
         }
 
+        public void Clear()
+        {
+            if (_session == null) return;
+            try { Invoke(_session, "Clear"); } catch (Exception) { }
+        }
+
+        public byte[] ReadDefiniteBlock() => BlockReader.ReadIncremental(this);
+
         public void Dispose() => Close();
 
         private void Ensure()
